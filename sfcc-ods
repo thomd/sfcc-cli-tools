@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+set -e
+
+#
+# Manage On-Demand Sandboxes
+#
+# OPTIONS
+#
+#    -R            list available realms
+#    -r REALM      set default realm [default: arvato]
+#    -S            list sandboxes of realm
+#    -s ALIAS      set default sandbox
+#    -n            create new sandbox in realm
+#    --sfra        deploy current SFRA on sandbox
+#    -N            create new sandbox in realm and deploy current SFRA on sandbox
+#
+# EXAMPLES
+#
+#    sfcc ods -S                                // list sandboxes of default realm
+#    DEBUG_ODS=true sfcc ods -S                 // show debug information
+#    sfcc ods -s 1                              // set sandbox `aaaa-001` as default sandbox
+#    sfcc ods -n                                // create new sandbox in default realm
+#    sfcc ods -N                                // create new sandbox in default realm and deploy SFRA
+#    sfcc-ci sandbox:delete -s aaaa-001         // delete sandbox 001 in realm-id abcd
+#    sfcc-ci sandbox:list                       // list sandboxes of all realms
+#    sfcc-ci sandbox:get -s aaaa-001            // print sandbox info
+
+
+## credentials for realms must be exported like:
+##
+##    export SFCC_REALM_ID_<name>=<realm_id>
+##    export SFCC_CLIENT_ID_<name>=<client_id>
+##    export SFCC_CLIENT_SECRET_<name>=<client_secret>
+##
+##
+## credentials for non-interactive authentication must be exported like:
+##
+##    export SFCC_API_USER=<account-manager-user>
+##    export SFCC_API_USER_PW=<account-manager-password>
+##
+##
+## github token for cloning sfra must be exported like:
+##
+##    export SFCC_GITHUB_TOKEN=<token>
+##
+
+
+## colors
+grey=$(tput setaf 8)
+red=$(tput setaf 1)
+green=$(tput setaf 2)
+blue=$(tput setaf 4)
+reset=$(tput sgr0)
+
+show_help() {
+  sed -n '/^#/p' < "$0" | sed '/^##/d' | sed 1d | sed 's/#/ /g' | perl -pe "s/(USAGE|OPTIONS|EXAMPLES| \/\/ .*$)/${grey}\1${reset}/"
+}
+
+yesno() {
+  echo ""
+  read -r -p "  $1 (y/N) " response
+  [[ $response == "y" || $response == "Y" ]] || exit 1
+}
+
+check_command_dependencies() {
+  local commands="npm jq"
+  for c in $commands
+  do
+    command -v $c >/dev/null && continue || { echo "$c not found."; exit 1; }
+  done
+}
+
+show_debug() {
+  if [ -n "$DEBUG_ODS" ]
+  then
+    echo ""
+    for var in "$@"
+    do
+      echo "  $blue[DEBUG] ${var}$reset"
+    done
+  fi
+}
+
+list_realms() {
+  echo ''
+  env | grep SFCC_REALM_ID \
+    | perl -pe 's/^SFCC_REALM_ID_(.*)=(.*)$/\1 \2/g' \
+    | awk -v I=${realm_name} -v G=${green} -v R=${reset} '{M=" ";if(I == $1){M="*"};printf("%s %s%s%s#(%s)\n"), M, G, $1, R, $2 }' \
+    | column -t -s '#'
+}
+
+get_realm_id() {
+  get_env_variable "SFCC_REALM_ID_$1"
+}
+
+get_client_id() {
+  get_env_variable "SFCC_CLIENT_ID_$1"
+}
+
+get_client_secret() {
+  get_env_variable "SFCC_CLIENT_SECRET_$1"
+}
+
+get_github_token() {
+  get_env_variable "SFCC_GITHUB_TOKEN"
+}
+
+get_env_variable(){
+  if [[ $(env | grep $1) ]]; then
+    envname="$1"
+    echo "${!envname}"
+  else
+    echo >&2 "  ${red}env variable ${grey}$1 ${red}missing!${reset}"
+    exit 1
+  fi
+}
+
+list_sandboxes() {
+  authenticate_client
+  echo ""
+  sfcc-ci sandbox:list --json \
+    | jq ".[] | select(.realm == \"${realm_id}\")" \
+    | jq -r '"  \(.realm)-\(.instance) \(.createdBy)"' \
+    | awk -v G=${grey} -v R=${reset} '{printf("  %s  %s%s%s\n"), $1, G, $2, R }'
+}
+
+set_realm() {
+  [ ! -n "$1" ] && echo -e >&2 "\n${red} realm name missing!" && exit 1
+  realm_name=$1
+  sandbox_alias=''
+  realm_id=$(get_realm_id $realm_name)
+  client_id=$(get_client_id $realm_name)
+  client_secret=$(get_client_secret $realm_name)
+  echo "realm $1" > "$config"
+}
+
+set_sandbox() {
+  [ ! -n "$1" ] && echo -e >&2 "\n${red} alias missing!" && exit 1
+  if [ -n "$1" ] && [ "$1" -eq "$1" ] 2>/dev/null; then
+    alias="${realm_id}-$(printf "%03d" $1)"
+  else
+    alias=$1
+  fi
+  local tempfile=$(mktemp)
+  cat "$config" | sed /sandbox/d > "$tempfile"; mv "$tempfile" "$config"
+  echo "sandbox $alias" >> "$config"
+  sandbox_alias=$alias
+}
+
+authenticate_client() {
+  show_debug $client_id $client_secret $SFCC_API_USER $SFCC_API_USER_PW
+  sfcc-ci client:auth $client_id $client_secret $SFCC_API_USER $SFCC_API_USER_PW > /dev/null
+}
+
+show_sandbox_url() {
+  authenticate_client
+  if [ -n "$sandbox_alias" ]; then
+    echo ""
+    echo "  Sandbox URL: ${grey}$(sfcc-ci sandbox:get -s $sandbox_alias -j | jq -r '.sandbox.links.bm')${reset}"
+  fi
+}
+
+show_defaults() {
+  echo ""
+  {
+    echo "  Realm:#${green}${realm_name}${reset}"
+    if [ -n "$sandbox_alias" ]; then
+      echo "  Sandbox:#${green}${sandbox_alias}${reset}"
+    fi
+  } | column -t -s "#"
+}
+
+create_new_sandbox() {
+  yesno "${grey}create new sandbox in ${green}${realm_name}${reset}${grey} realm?${reset}"
+  authenticate_client
+  echo ""
+
+  begin "provisioning new sandbox for $realm_id ..."
+  local sandbox=$(sfcc-ci sandbox:create -r $realm_id -s -j)
+  local message=$($sandbox | jq '.message' -r)
+  echo $message
+  local alias=$($sandbox | jq '.instance.alias' -r)
+  set_sandbox $alias
+  finish
+
+  show_sandbox_url
+}
+
+deploy_sfra() {
+  github_token=$(get_github_token)
+  sandbox_alias=$(cat "$config" | awk '/sandbox/{print $2}')
+  if [ ! -n "$sandbox_alias" ]; then
+    echo >&2 "  ${red}default sandbox missing!${reset}"
+    exit 1
+  fi
+  yesno "deploy SFRA on ${green}${sandbox_alias}${reset} sandbox in ${green}${realm_name}${reset} realm?"
+  authenticate_client
+  echo ""
+  local temp_logfile=$(mktemp)
+  echo "  logfile: ${grey}$temp_logfile${reset}"
+  echo ""
+  local temp_sfra=$(mktemp -d)
+  echo $temp_sfra > $temp_logfile
+
+  begin "downloading SFRA ..."
+  url="https://thduerr:${github_token}@github.com/SalesforceCommerceCloud/storefront-reference-architecture.git"
+  git clone --progress $url $temp_sfra 2>> $temp_logfile
+  finish
+
+  begin "building SFRA ..."
+  cd $temp_sfra
+  npm install >> $temp_logfile 2>&1
+  npm run compile:js >> $temp_logfile 2>&1
+  npm run compile:scss >> $temp_logfile 2>&1
+  npm run compile:fonts >> $temp_logfile 2>&1
+  finish
+
+  begin "uploading SFRA ..."
+  mv cartridges version1
+  zip -r version1.zip version1/ >> $temp_logfile
+  sfcc-ci code:deploy version1.zip -i $sandbox_alias >> $temp_logfile
+  local active_codeversion=$(sfcc ci code:list -i $sandbox_alias -j | jq -r '.data[] | select(.active == true) | .id')
+  if [ ! $active_codeversion == "version1" ]; then
+    sfcc-ci code:activate version1 -i $sandbox_alias >> $temp_logfile
+  fi
+  cd ..
+  finish
+
+  begin "downloading SFRA data ..."
+  local temp_sfra_data=$(mktemp -d)
+  url="https://thduerr:${github_token}@github.com/SalesforceCommerceCloud/storefrontdata.git"
+  git clone --progress $url $temp_sfra_data 2>> $temp_logfile
+  finish
+
+  begin "building SFRA data ..."
+  cd $temp_sfra_data
+  npm run zipData >> $temp_logfile 2>&1
+  finish
+
+  begin "importing SFRA data ..."
+  sfcc-ci instance:upload demo_data_sfra.zip -i $sandbox_alias >> $temp_logfile
+  sfcc-ci instance:import demo_data_sfra.zip -s -i $sandbox_alias >> $temp_logfile
+  finish
+
+  begin "indexing SFRA data ..."
+  sfcc-ci job:run Reindex -s -i $sandbox_alias >> $temp_logfile
+  finish
+
+  echo ""
+  echo "  deployment finished!"
+}
+
+main() {
+  [ $# == 0 ] && show_defaults
+
+  while test $# -ne 0; do
+    arg=$1
+    shift
+    case $arg in
+      -R|--realms)
+        list_realms
+        ;;
+      -r|--realm)
+        set_realm $1
+        show_defaults
+        shift
+        ;;
+      -S|--sandboxes)
+        show_defaults
+        show_sandbox_url
+        list_sandboxes
+        ;;
+      -s|--sandbox)
+        set_sandbox $1
+        show_defaults
+        shift
+        ;;
+      -n|--new)
+        create_new_sandbox
+        show_sandbox_url
+        show_defaults
+        list_sandboxes
+        ;;
+      --sfra)
+        deploy_sfra
+        show_sandbox_url
+        ;;
+      -N|--new-sfra)
+        create_new_sandbox
+        deploy_sfra
+        show_sandbox_url
+        ;;
+      -h|--help|*)
+        show_help
+        ;;
+    esac
+  done
+
+  show_debug "realm_name: $realm_name" "sandbox_alias: $sandbox_alias" "realm_id: $realm_id" "client_id: $client_id" "client_secret: $client_secret"
+  exit 0
+}
+
+message() {
+  msg=$1
+  len=${#msg}
+  msg=${msg//\(/$grey}
+  msg=${msg//\)/$reset}
+  echo -e "  $msg"
+}
+
+begin() {
+  startTime=$(date +%s)
+  message "$1 "
+}
+
+finish() {
+  endTime=$(date +%s)
+  duration=$(date -j -f %s $((endTime - startTime)) +%M:%S)
+  if [ ! "$duration" == "00:00" ]; then
+    echo -e "$(tput cuu 1)$(tput cuf $((len+2)))$grey[$duration]$reset"
+  fi
+}
+
+
+## init
+check_command_dependencies
+config="$HOME/.sfcc-ods"
+if [ ! -f "$config" ]; then
+  echo "realm arvato" > "$config"
+fi
+
+realm_name=$(cat "$config" | awk '/realm/{print $2}')
+sandbox_alias=$(cat "$config" | awk '/sandbox/{print $2}')
+realm_id=$(get_realm_id $realm_name)
+client_id=$(get_client_id $realm_name)
+client_secret=$(get_client_secret $realm_name)
+
+main "$@"
+exit 0
