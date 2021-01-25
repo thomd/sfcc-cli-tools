@@ -156,7 +156,7 @@ show_sandbox_url() {
   authenticate_client
   if [ -n "$sandbox_alias" ]; then
     echo ""
-    echo "  Sandbox URL: ${grey}$(sfcc-ci sandbox:get -s $sandbox_alias -j | jq -r '.sandbox.links.bm')${reset}"
+    echo "  sandbox URL: ${grey}$(sfcc-ci sandbox:get -s $sandbox_alias -j | jq -r '.sandbox.links.bm')${reset}"
   fi
 }
 
@@ -171,19 +171,12 @@ show_defaults() {
 }
 
 create_new_sandbox() {
-  yesno "${grey}create new sandbox in ${green}${realm_name}${reset}${grey} realm?${reset}"
-  authenticate_client
   echo ""
-
-  begin "provisioning new sandbox for $realm_id ..."
+  begin "provisioning new sandbox for ${realm_id} ..."
   local sandbox=$(sfcc-ci sandbox:create -r $realm_id -s -j)
-  local message=$($sandbox | jq '.message' -r)
-  echo $message
-  local alias=$($sandbox | jq '.instance.alias' -r)
+  local alias=$(echo $sandbox | jq -r '.instance.alias' | head -n 1 | tr -d '\n')
   set_sandbox $alias
   finish
-
-  show_sandbox_url
 }
 
 deploy_sfra() {
@@ -193,15 +186,11 @@ deploy_sfra() {
     echo >&2 "  ${red}default sandbox missing!${reset}"
     exit 1
   fi
-  yesno "deploy SFRA on ${green}${sandbox_alias}${reset} sandbox in ${green}${realm_name}${reset} realm?"
-  authenticate_client
-  echo ""
   local temp_logfile=$(mktemp)
-  echo "  logfile: ${grey}$temp_logfile${reset}"
-  echo ""
   local temp_sfra=$(mktemp -d)
   echo $temp_sfra > $temp_logfile
 
+  echo ""
   begin "downloading SFRA ..."
   url="https://thduerr:${github_token}@github.com/SalesforceCommerceCloud/storefront-reference-architecture.git"
   git clone --progress $url $temp_sfra 2>> $temp_logfile
@@ -248,6 +237,8 @@ deploy_sfra() {
 
   echo ""
   echo "  deployment finished!"
+  echo ""
+  echo "  logfile: ${grey}$temp_logfile${reset}"
 }
 
 main() {
@@ -276,16 +267,20 @@ main() {
         shift
         ;;
       -n|--new)
+        yesno "create new empty sandbox in ${green}${realm_name}${reset} (${green}${realm_id}${reset}) realm?"
+        authenticate_client
         create_new_sandbox
         show_sandbox_url
-        show_defaults
-        list_sandboxes
         ;;
       --sfra)
+        yesno "deploy SFRA on ${green}${sandbox_alias}${reset} sandbox in ${green}${realm_name}${reset} realm?"
+        authenticate_client
         deploy_sfra
         show_sandbox_url
         ;;
       -N|--new-sfra)
+        yesno "create new SFRA sandbox in ${green}${realm_name}${reset} (${green}${realm_id}${reset}) realm?"
+        authenticate_client
         create_new_sandbox
         deploy_sfra
         show_sandbox_url
@@ -300,17 +295,10 @@ main() {
   exit 0
 }
 
-message() {
-  msg=$1
-  len=${#msg}
-  msg=${msg//\(/$grey}
-  msg=${msg//\)/$reset}
-  echo -e "  $msg"
-}
-
 begin() {
   startTime=$(date +%s)
-  message "$1 "
+  len=${#1}
+  echo -e "  $1"
 }
 
 finish() {
