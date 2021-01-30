@@ -13,17 +13,19 @@ set -e
 #    -n            create new sandbox in realm
 #    --sfra        deploy current SFRA on sandbox
 #    -N            create new sandbox in realm and deploy current SFRA on sandbox
+#    --ide         create an IDE for SFRA in current directory
 #
 # EXAMPLES
 #
-#    sfcc ods -S                                // list sandboxes of default realm
-#    DEBUG_ODS=true sfcc ods -S                 // show debug information
-#    sfcc ods -s 1                              // set sandbox `aaaa-001` as default sandbox
-#    sfcc ods -n                                // create new sandbox in default realm
-#    sfcc ods -N                                // create new sandbox in default realm and deploy SFRA
-#    sfcc-ci sandbox:delete -s aaaa-001         // delete sandbox 001 in realm-id abcd
-#    sfcc-ci sandbox:list                       // list sandboxes of all realms
-#    sfcc-ci sandbox:get -s aaaa-001            // print sandbox info
+#    sfcc ods -S                                     // list sandboxes of default realm
+#    DEBUG_ODS=true sfcc ods -S                      // show debug information
+#    sfcc ods -s 3                                   // set sandbox `aaaa-003` as default sandbox
+#    sfcc ods -n                                     // create new sandbox in default realm
+#    sfcc ods -N                                     // create new sandbox in default realm and deploy SFRA
+#    sfcc-ci sandbox:delete -s aaaa-001              // delete sandbox '001' in realm 'aaaa'
+#    sfcc-ci sandbox:list                            // list sandboxes of all realms
+#    sfcc-ci sandbox:get -s aaaa-001                 // print sandbox info
+#    sfcc-ci sandbox:update -s aaaa-001 --ttl 0      // remove EOL of a sandbox
 
 
 ## credentials for realms must be exported like:
@@ -46,7 +48,7 @@ set -e
 
 
 ## colors
-grey=$(tput setaf 8)
+grey=$(tput setaf 0)
 red=$(tput setaf 1)
 green=$(tput setaf 2)
 blue=$(tput setaf 4)
@@ -60,6 +62,7 @@ yesno() {
   echo ""
   read -r -p "  $1 (y/N) " response
   [[ $response == "y" || $response == "Y" ]] || exit 1
+  echo ""
 }
 
 check_command_dependencies() {
@@ -163,16 +166,16 @@ show_sandbox_url() {
 show_defaults() {
   echo ""
   {
-    echo "  Realm:#${green}${realm_name}${reset}"
+    echo "  realm:#${green}${realm_name}${reset}"
     if [ -n "$sandbox_alias" ]; then
-      echo "  Sandbox:#${green}${sandbox_alias}${reset}"
+      echo "  sandbox:#${green}${sandbox_alias}${reset}"
     fi
   } | column -t -s "#"
 }
 
 create_new_sandbox() {
-  echo ""
   begin "provisioning new sandbox for ${realm_id} ..."
+  export SFCC_IGNORE_WARNINGS=true
   local sandbox=$(sfcc-ci sandbox:create -r $realm_id -s -j)
   local alias=$(echo $sandbox | jq -r '.instance.alias' | head -n 1 | tr -d '\n')
   set_sandbox $alias
@@ -190,7 +193,6 @@ deploy_sfra() {
   local temp_sfra=$(mktemp -d)
   echo $temp_sfra > $temp_logfile
 
-  echo ""
   begin "downloading SFRA ..."
   url="https://thduerr:${github_token}@github.com/SalesforceCommerceCloud/storefront-reference-architecture.git"
   git clone --progress $url $temp_sfra 2>> $temp_logfile
@@ -241,6 +243,21 @@ deploy_sfra() {
   echo "  logfile: ${grey}$temp_logfile${reset}"
 }
 
+setup_sfra_ide() {
+  echo ""
+  url="https://thduerr:${github_token}@github.com/SalesforceCommerceCloud/storefront-reference-architecture.git"
+  git clone --progress $url
+  cd storefront-reference-architecture
+  npm install
+  npm run compile:js
+  npm run compile:scss
+  npm run compile:fonts
+  # TODO:
+  #   create ./dw.json
+  #   create  .vscode/jsconfig.json
+  #   create  .vscode/launch.json
+}
+
 main() {
   [ $# == 0 ] && show_defaults
 
@@ -278,10 +295,16 @@ main() {
         deploy_sfra
         show_sandbox_url
         ;;
+      --ide)
+        yesno "setup IDE with SFRA in current directory for sandbox ${green}${sandbox_alias}${reset}?"
+        authenticate_client
+        setup_sfra_ide
+        ;;
       -N|--new-sfra)
         yesno "create new SFRA sandbox in ${green}${realm_name}${reset} (${green}${realm_id}${reset}) realm?"
         authenticate_client
         create_new_sandbox
+        authenticate_client
         deploy_sfra
         show_sandbox_url
         ;;
@@ -305,7 +328,7 @@ finish() {
   endTime=$(date +%s)
   duration=$(date -j -f %s $((endTime - startTime)) +%M:%S)
   if [ ! "$duration" == "00:00" ]; then
-    echo -e "$(tput cuu 1)$(tput cuf $((len+2)))$grey[$duration]$reset"
+    echo -e "$(tput cuu 1)$(tput cuf $((len+3)))$grey[$duration]$reset"
   fi
 }
 
